@@ -72,7 +72,7 @@ Don't use this mod together with [Center New Windows](https://github.com/ramenso
   $description: A centered window stays invisible until its contents finish drawing (half a second at most), avoiding the native flicker. Windows drawn with DirectX (browsers, WPF, WinUI) can't be detected and gain little. Opening animations may be skipped; turn off to keep them.
 - ignoreHotkey: Win+Alt+I
   $name: Ignore hotkey
-  $description: Add/remove the active window to the list. Modifiers (Ctrl, Alt, Shift, Win) and one key, joined with + (Win+Alt+I). Leave empty for no hotkey.
+  $description: Add/remove the active window to the list. Win + Ctrl, Alt, Shift + key, like Win+Alt+I. Leave empty for no hotkey.
 - listHotkey: Win+Ctrl+Alt+I
   $name: Ignored list hotkey
   $description: Opens the list of ignored windows, same format as above. If empty, the list opens whenever these settings are saved.
@@ -981,7 +981,8 @@ UINT KeyFromName(const wchar_t* name) {
     return 0;
 }
 
-/// Parses "Ctrl+Alt+K" into MOD_* modifiers and a virtual key. False if empty or invalid.
+/// Parses "Win+Alt+K" into MOD_* modifiers and a virtual key. False if empty or invalid, including
+/// without Win plus at least one other modifier: Shift+letter or Ctrl+letter would catch ordinary typing.
 bool ParseHotkey(const wchar_t* text, UINT* mods, UINT* vk) {
     *mods = 0;
     *vk = 0;
@@ -1007,7 +1008,7 @@ bool ParseHotkey(const wchar_t* text, UINT* mods, UINT* vk) {
         else if (*vk || !(*vk = KeyFromName(tok)))
             return false;
     }
-    return *vk != 0;
+    return *vk && (*mods & MOD_WIN) && (*mods & ~MOD_WIN);
 }
 
 bool RegisterHotkeyText(int id, const wchar_t* text) {
