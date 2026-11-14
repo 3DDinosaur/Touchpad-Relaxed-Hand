@@ -79,7 +79,7 @@ Reading the touchpad follows the approach of the [Three Finger Drag](https://win
   - high: High
 - tapFeedback: false
   $name: Tap and hold feedback
-  $description: The pointer briefly turns into the Person Select pointer when taps and holds are captured, since there's no button feedback.
+  $description: A small dot briefly appears beside the pointer when taps and holds are captured, since there's no button feedback.
 - multiplierMore: "1.5"
   $name: 5-3 fingers speed multiplier
   $description: When more fingers are gliding and you'd need room to travel. 1.0 is the system's touchpad speed and acceleration, 1.5 is 50% faster.
@@ -109,7 +109,7 @@ Reading the touchpad follows the approach of the [Three Finger Drag](https://win
   - touch: Touch
 - diagHotkey: ""
   $name: Diagnostics overlay hotkey
-  $description: Shows how the mod reads each finger, for troubleshooting. Ctrl, Alt, Shift or Win joined with + to a letter, like Win+Shift+F. Empty for none.
+  $description: Shows how the mod reads each finger, for troubleshooting. Win + Ctrl, Alt, Shift + key, like Win+Shift+F. Empty for none.
 */
 // ==/WindhawkModSettings==
 
@@ -583,8 +583,9 @@ bool ParseHotkey(PCWSTR text, UINT& mods, UINT& key) {
         }
         start = end + 1;
     }
-    // A key alone would be taken from every program while the mod runs.
-    return key && mods;
+    // Win and one more modifier: the hotkey is taken from every program while the mod runs, and without Win it
+    // took keys they use (Shift+letter swallowed capitals); Win and a key alone are mostly Windows' own.
+    return key && (mods & MOD_WIN) && (mods & (MOD_CONTROL | MOD_ALT | MOD_SHIFT));
 }
 
 void LoadSettings() {
@@ -831,44 +832,297 @@ void EndGlide() {
     }
 }
 
+void FeedbackRelease();
+
 void ResetSession() {
     EndGlide();
+    FeedbackRelease();
     g_frame.clear();
     g_frameExpected = 0;
 }
 
 // Output.
 
-// Taps and holds have no button under the finger: the pointer turns into the system's Person Select while a
-// button is down, and for kFeedbackMs after a click: the mod's own, and Windows' within kNativeClickMs of a
-// touchpad report (a mouse beside it isn't clicked with the hand on the pad). Touchpad thread only.
+// Taps and holds have no button under the finger: a small dot shows beside the pointer while a button is
+// down, and for kFeedbackMs after a click: the mod's own, and Windows' within kNativeClickMs of a touchpad report
+// (a mouse beside it isn't clicked with the hand on the pad). It's a click-through window, not the system
+// cursor: swapping that reached every program, reloading the scheme undid other programs' cursors, and a crash
+// left it swapped. Touchpad thread only.
 constexpr UINT kFeedbackMs = 200;
 constexpr DWORD kNativeClickMs = 200;
-// Not the I-beam: other tools (a Caps Lock I-beam) swap it too, and the last to write wins.
-constexpr DWORD kFeedbackCursors[] = {32512, 32649};  // OCR_NORMAL, OCR_HAND
-bool g_feedbackShown;
+constexpr WCHAR kBadgeClassName[] = L"Touchpad_Relaxed_Hand_Feedback";
+// The dot, in shares of the pointer's height: its size, and its center right of (X) and below (Y) the hot spot,
+// the point that clicks: off the tip so that it doesn't hide what's clicked, and clear of the arrow's edge.
+constexpr double kBadgeSize = 0.30;
+constexpr double kBadgeAtX = 0.60;
+constexpr double kBadgeAtY = 0.60;
 
-// SetSystemCursor replaces the cursor for every program; SPI_SETCURSORS reloads the user's scheme, so a cross
-// left by a crash goes at the next scheme change or sign-in.
+// The badge lives on its own thread, which moves it once per screen frame (DwmFlush): moved on mouse events by
+// the touchpad thread, it trailed the pointer by a fraction of a second in a drag. A window still comes a frame
+// behind the pointer, which the graphics card draws on its own.
+struct {
+    HWND hWnd;
+    HDC dc;
+    HBITMAP bmp;
+    HGDIOBJ oldBmp;
+    int side;    // px
+    int offsetX, offsetY;  // px right of and below the pointer's hot spot
+    bool shown;  // badge thread only
+    HANDLE thread;
+    HANDLE wake;              // set when want changes, or to quit
+    std::atomic<bool> want;   // set by the touchpad thread
+    std::atomic<bool> quit;
+} g_badge;
+
+// The pointer's height in px, as drawn now: it follows the pointer size setting and the monitor's scale.
+int CursorHeight() {
+    int height = 32;
+    CURSORINFO info{.cbSize = sizeof(info)};
+    ICONINFO icon;
+    if (GetCursorInfo(&info) && info.hCursor && GetIconInfo(info.hCursor, &icon)) {
+        BITMAP bm;
+        if (GetObject(icon.hbmColor ? icon.hbmColor : icon.hbmMask, sizeof(bm), &bm)) {
+            height = icon.hbmColor ? bm.bmHeight : bm.bmHeight / 2;  // a mask alone holds AND and XOR halves
+        }
+        if (icon.hbmColor) {
+            DeleteObject(icon.hbmColor);
+        }
+        DeleteObject(icon.hbmMask);
+    }
+    return std::max(height, 16);
+}
+
+// The pointer's fill and outline, read from the arrow as the system draws it now, so that the badge follows the
+// pointer scheme and its color setting: the most common opaque color, and the most common one far from it.
+// A black-and-white (inverting) arrow keeps white with black.
+void PointerColors(COLORREF& fill, COLORREF& line) {
+    fill = RGB(255, 255, 255);
+    line = RGB(0, 0, 0);
+    ICONINFO icon;
+    HCURSOR arrow = LoadCursor(nullptr, IDC_ARROW);
+    if (!arrow || !GetIconInfo(arrow, &icon)) {
+        return;
+    }
+    BITMAP bm;
+    if (icon.hbmColor && GetObject(icon.hbmColor, sizeof(bm), &bm)) {
+        int w = bm.bmWidth;
+        int h = bm.bmHeight;
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        std::vector<DWORD> color(w * h);
+        std::vector<DWORD> mask(w * h);
+        HDC screen = GetDC(nullptr);
+        bool read = GetDIBits(screen, icon.hbmColor, 0, h, color.data(), &bi, DIB_RGB_COLORS) &&
+                    GetDIBits(screen, icon.hbmMask, 0, h, mask.data(), &bi, DIB_RGB_COLORS);
+        ReleaseDC(nullptr, screen);
+        if (read) {
+            bool alpha = std::any_of(color.begin(), color.end(), [](DWORD c) { return c >> 24; });
+            std::unordered_map<DWORD, int> count;  // 0xRRGGBB, rounded to 16 levels a channel
+            for (int i = 0; i < w * h; i++) {
+                bool opaque = alpha ? (color[i] >> 24) >= 200 : (mask[i] & 0xFFFFFF) == 0;
+                if (opaque) {
+                    count[color[i] & 0xF0F0F0]++;
+                }
+            }
+            auto distance = [](DWORD a, DWORD b) {
+                return std::abs((int)(a >> 16 & 255) - (int)(b >> 16 & 255)) +
+                       std::abs((int)(a >> 8 & 255) - (int)(b >> 8 & 255)) + std::abs((int)(a & 255) - (int)(b & 255));
+            };
+            DWORD best = 0;
+            int bestCount = 0;
+            for (auto [c, n] : count) {
+                if (n > bestCount) {
+                    best = c;
+                    bestCount = n;
+                }
+            }
+            if (bestCount) {
+                DWORD other = 0;
+                int otherCount = 0;
+                for (auto [c, n] : count) {
+                    if (distance(c, best) >= 160 && n > otherCount) {
+                        other = c;
+                        otherCount = n;
+                    }
+                }
+                auto toRef = [](DWORD c) {
+                    int r = c >> 16 & 255, g = c >> 8 & 255, b = c & 255;
+                    return RGB(r | r >> 4, g | g >> 4, b | b >> 4);
+                };
+                fill = toRef(best);
+                bool light = (best >> 16 & 255) + (best >> 8 & 255) + (best & 255) >= 3 * 128;
+                line = otherCount ? toRef(other) : (light ? RGB(0, 0, 0) : RGB(255, 255, 255));
+            }
+        }
+    }
+    if (icon.hbmColor) {
+        DeleteObject(icon.hbmColor);
+    }
+    DeleteObject(icon.hbmMask);
+}
+
+// A dot in the pointer's colors, antialiased over 4x4 samples a pixel, in premultiplied alpha for
+// UpdateLayeredWindow.
+void BadgeRender(int side, COLORREF fill, COLORREF line) {
+    if (g_badge.bmp) {
+        SelectObject(g_badge.dc, g_badge.oldBmp);
+        DeleteObject(g_badge.bmp);
+        g_badge.bmp = nullptr;
+    }
+    g_badge.side = side;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = side;
+    bi.bmiHeader.biHeight = -side;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    g_badge.bmp = CreateDIBSection(g_badge.dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!g_badge.bmp) {
+        return;
+    }
+    g_badge.oldBmp = SelectObject(g_badge.dc, g_badge.bmp);
+    double outer = side / 2.0;
+    double inner = outer - std::max(1.0, side / 7.0);  // inside it the fill, out to outer the outline
+    DWORD* px = (DWORD*)bits;
+    for (int y = 0; y < side; y++) {
+        for (int x = 0; x < side; x++) {
+            int alpha = 0, r = 0, g = 0, b = 0;
+            for (int sy = 0; sy < 4; sy++) {
+                for (int sx = 0; sx < 4; sx++) {
+                    double d = std::hypot(x + (sx + 0.5) / 4 - outer, y + (sy + 0.5) / 4 - outer);
+                    if (d > outer) {
+                        continue;
+                    }
+                    COLORREF c = d <= inner ? fill : line;
+                    alpha++;
+                    r += GetRValue(c);
+                    g += GetGValue(c);
+                    b += GetBValue(c);
+                }
+            }
+            px[y * side + x] = ((DWORD)(alpha * 255 / 16) << 24) | ((DWORD)(r / 16) << 16) | ((DWORD)(g / 16) << 8) |
+                               (DWORD)(b / 16);
+        }
+    }
+}
+
+void BadgeShow() {
+    int height = CursorHeight();
+    COLORREF fill, line;
+    PointerColors(fill, line);
+    BadgeRender(std::max(6, (int)std::lround(height * kBadgeSize)), fill, line);
+    g_badge.offsetX = (int)std::lround(height * kBadgeAtX) - g_badge.side / 2;
+    g_badge.offsetY = (int)std::lround(height * kBadgeAtY) - g_badge.side / 2;
+    POINT pt{};
+    GetCursorPos(&pt);
+    POINT at{pt.x + g_badge.offsetX, pt.y + g_badge.offsetY};
+    SIZE size{g_badge.side, g_badge.side};
+    POINT zero{};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(g_badge.hWnd, nullptr, &at, &size, g_badge.dc, &zero, 0, &blend, ULW_ALPHA);
+    SetWindowPos(g_badge.hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    ShowWindow(g_badge.hWnd, SW_SHOWNOACTIVATE);
+    g_badge.shown = true;
+}
+
+DWORD WINAPI BadgeThread(LPVOID param) {
+    HINSTANCE hInstance = (HINSTANCE)param;
+    WNDCLASS wc{
+        .lpfnWndProc = DefWindowProc,
+        .hInstance = hInstance,
+        .lpszClassName = kBadgeClassName,
+    };
+    RegisterClass(&wc);
+    g_badge.hWnd = CreateWindowEx(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
+                                      WS_EX_NOACTIVATE,
+                                  kBadgeClassName, nullptr, WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, hInstance,
+                                  nullptr);
+    g_badge.dc = CreateCompatibleDC(nullptr);
+    // Loaded at run time: linked, it needed dwmapi in the compiler options.
+    using DwmFlushFn = HRESULT(WINAPI*)();
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    auto dwmFlush = dwm ? (DwmFlushFn)(void*)GetProcAddress(dwm, "DwmFlush") : nullptr;
+    POINT last{LONG_MIN, LONG_MIN};
+    while (!g_badge.quit) {
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            DispatchMessage(&msg);
+        }
+        bool want = g_badge.want;
+        if (want && !g_badge.shown && g_badge.hWnd) {
+            BadgeShow();
+            last = {LONG_MIN, LONG_MIN};
+        } else if (!want && g_badge.shown) {
+            ShowWindow(g_badge.hWnd, SW_HIDE);
+            g_badge.shown = false;
+        }
+        if (!g_badge.shown) {
+            MsgWaitForMultipleObjects(1, &g_badge.wake, FALSE, INFINITE, QS_ALLINPUT);
+            continue;
+        }
+        if (!dwmFlush || FAILED(dwmFlush())) {
+            Sleep(8);
+        }
+        POINT pt;
+        if (GetCursorPos(&pt) && (pt.x != last.x || pt.y != last.y)) {
+            last = pt;
+            SetWindowPos(g_badge.hWnd, nullptr, pt.x + g_badge.offsetX, pt.y + g_badge.offsetY, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    if (g_badge.hWnd) {
+        DestroyWindow(g_badge.hWnd);
+    }
+    if (g_badge.bmp) {
+        SelectObject(g_badge.dc, g_badge.oldBmp);
+        DeleteObject(g_badge.bmp);
+    }
+    if (g_badge.dc) {
+        DeleteDC(g_badge.dc);
+    }
+    if (dwm) {
+        FreeLibrary(dwm);
+    }
+    UnregisterClass(kBadgeClassName, hInstance);
+    return 0;
+}
+
+void BadgeCreate(HINSTANCE hInstance) {
+    g_badge.wake = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    g_badge.thread = CreateThread(nullptr, 0, BadgeThread, hInstance, 0, nullptr);
+}
+
+void BadgeDestroy(HINSTANCE hInstance) {
+    if (g_badge.thread) {
+        g_badge.quit = true;
+        SetEvent(g_badge.wake);
+        WaitForSingleObject(g_badge.thread, INFINITE);
+        CloseHandle(g_badge.thread);
+        g_badge.thread = nullptr;
+    }
+    if (g_badge.wake) {
+        CloseHandle(g_badge.wake);
+        g_badge.wake = nullptr;
+    }
+}
+
+bool g_feedbackShown;  // touchpad thread's view of the badge
+
 void FeedbackShow(bool show) {
     if (show == g_feedbackShown) {
         return;
     }
     g_feedbackShown = show;
-    if (!show) {
-        SystemParametersInfo(SPI_SETCURSORS, 0, nullptr, 0);
-        return;
-    }
-    // Person Select (IDC_PERSON, Windows 10 1703 and later), or the cross where it's missing.
-    HCURSOR shape = LoadCursor(nullptr, MAKEINTRESOURCE(32672));
-    if (!shape) {
-        shape = LoadCursor(nullptr, IDC_CROSS);
-    }
-    for (DWORD id : kFeedbackCursors) {
-        HCURSOR copy = CopyCursor(shape);
-        if (copy && !SetSystemCursor(copy, id)) {
-            DestroyCursor(copy);
-        }
+    g_badge.want = show;
+    if (g_badge.wake) {
+        SetEvent(g_badge.wake);
     }
 }
 
@@ -892,8 +1146,7 @@ void Feedback(bool down) {
 // system comes with them.
 bool g_mouseListening;
 
-void FeedbackListen() {
-    bool listen = g_tapFeedback;
+void FeedbackListen(bool listen) {
     if (listen == g_mouseListening) {
         return;
     }
@@ -912,10 +1165,24 @@ void FeedbackListen() {
 
 // The middle button is the three or four-finger tap set to middle click. Windows keeps a tap's button down for a
 // moment after it, in case the finger comes back to drag: shown until it came up, a native tap lasted longer
-// than the mod's. A native press is shown as a click, and as a hold only once the pointer moves with the button
-// down. A scroll is shown for as long as its wheel turns: Windows' two-finger scroll, and the mod's inertia.
-bool g_nativeDown;     // a native touchpad button is down
-bool g_nativeDragged;  // and the pointer moved with it
+// than the mod's. A native press is shown as a click, and as a hold once the pointer moves with the button down,
+// or once the click's moment ends with the button still down and a finger on the pad (tap and hold, still).
+// A scroll is shown for as long as its wheel turns: Windows' two-finger scroll, and the mod's inertia.
+bool g_nativeDown;  // a native touchpad button is down
+bool g_nativeHeld;  // and shown as a hold
+int g_padTouching;  // contacts on the pad at the last frame
+bool g_feedbackScroll;  // the mod's scroll is shown
+
+// The session reset (stale frames, lock, suspend, device removed) ends what's shown as held: its release may
+// never come.
+void FeedbackRelease() {
+    g_nativeDown = false;
+    g_nativeHeld = false;
+    g_feedbackScroll = false;
+    if (g_feedbackDown) {
+        Feedback(false);
+    }
+}
 
 void FeedbackMouse(const RAWMOUSE& mouse) {
     USHORT flags = mouse.usButtonFlags;
@@ -925,16 +1192,17 @@ void FeedbackMouse(const RAWMOUSE& mouse) {
         if (flags & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_DOWN)) {
             if (pad) {
                 g_nativeDown = true;
-                g_nativeDragged = false;
+                g_nativeHeld = false;
                 Feedback(false);
             }
         } else if (flags & (RI_MOUSE_LEFT_BUTTON_UP | RI_MOUSE_RIGHT_BUTTON_UP | RI_MOUSE_MIDDLE_BUTTON_UP)) {
-            if (g_nativeDown && g_nativeDragged) {
+            if (g_nativeDown && g_nativeHeld) {
                 Feedback(false);
             }
             g_nativeDown = false;
-        } else if (g_nativeDown && !g_nativeDragged && (mouse.lLastX || mouse.lLastY)) {
-            g_nativeDragged = true;
+            g_nativeHeld = false;
+        } else if (g_nativeDown && !g_nativeHeld && (mouse.lLastX || mouse.lLastY)) {
+            g_nativeHeld = true;
             Feedback(true);
         }
     }
@@ -2570,10 +2838,9 @@ double Median(std::vector<double>& v) {
 
 // The mod's scroll (tap, then rest and slide) shows as a hold does: from the rest until it ends, moving or not.
 void FeedbackScroll() {
-    static bool shown;
     bool scrolling = g_two.scrolling || g_state.scrollSession;
-    if (scrolling != shown) {
-        shown = scrolling;
+    if (scrolling != g_feedbackScroll) {
+        g_feedbackScroll = scrolling;
         Feedback(scrolling);
     }
 }
@@ -2618,6 +2885,7 @@ void ProcessFrame() {
         g_state.lastHand = hand;
         g_state.countChangeTime = now;
     }
+    g_padTouching = touching;
     UpdateTracks(fingers, tips, now, touching);
     Learn(fingers, touching, t);
     TrackTwoFingers(fingers, touching, now);
@@ -3124,18 +3392,25 @@ void OnReport(const Device& dev, PCHAR report, ULONG length) {
 }
 
 void OnRawInput(HRAWINPUT hRawInput) {
-    UINT size = 0;
-    if (GetRawInputData(hRawInput, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || !size) {
-        return;
+    // Read in one call into a buffer that holds a mouse event or a usual touchpad report; a bigger one is read
+    // again at its size. With the feedback on, every mouse event of the system comes through here.
+    alignas(8) static BYTE small[512];
+    static std::vector<BYTE> big;
+    const BYTE* data = small;
+    UINT size = sizeof(small);
+    if (GetRawInputData(hRawInput, RID_INPUT, small, &size, sizeof(RAWINPUTHEADER)) == (UINT)-1) {
+        size = 0;
+        if (GetRawInputData(hRawInput, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || !size) {
+            return;
+        }
+        big.resize(size);
+        if (GetRawInputData(hRawInput, RID_INPUT, big.data(), &size, sizeof(RAWINPUTHEADER)) == (UINT)-1) {
+            return;
+        }
+        data = big.data();
     }
 
-    static std::vector<BYTE> buffer;
-    buffer.resize(size);
-    if (GetRawInputData(hRawInput, RID_INPUT, buffer.data(), &size, sizeof(RAWINPUTHEADER)) == (UINT)-1) {
-        return;
-    }
-
-    const RAWINPUT* raw = (const RAWINPUT*)buffer.data();
+    const RAWINPUT* raw = (const RAWINPUT*)data;
     if (raw->header.dwType == RIM_TYPEMOUSE) {
         FeedbackMouse(raw->data.mouse);
         return;
@@ -3225,7 +3500,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 
         case kHotkeySettingMessage:
             VizUpdateHotkey();
-            FeedbackListen();
+            FeedbackListen(g_tapFeedback);
             if (!g_tapFeedback) {
                 FeedbackShow(false);
             }
@@ -3234,7 +3509,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER:
             if (wParam == kFeedbackTimerId) {
                 KillTimer(hWnd, kFeedbackTimerId);
-                FeedbackShow(false);
+                if (g_nativeDown && !g_nativeHeld && g_padTouching > 0) {
+                    g_nativeHeld = true;
+                    Feedback(true);
+                } else {
+                    FeedbackShow(false);
+                }
                 return 0;
             }
             if (wParam == kShowPointerTimerId) {
@@ -3335,6 +3615,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
     }
 
     VizCreate(hInstance);
+    BadgeCreate(hInstance);
     VizUpdateHotkey();
 
     RAWINPUTDEVICE rid{
@@ -3345,12 +3626,11 @@ DWORD WINAPI WorkerThread(LPVOID) {
     };
     if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
         WTSRegisterSessionNotification(g_hWnd, NOTIFY_FOR_THIS_SESSION);
-        FeedbackListen();
+        FeedbackListen(g_tapFeedback);
 
         RunMessageLoop();
 
-        g_tapFeedback = false;
-        FeedbackListen();
+        FeedbackListen(false);
         SetWheelBlock(false);
         WTSUnRegisterSessionNotification(g_hWnd);
 
@@ -3362,7 +3642,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
     }
 
     UnregisterHotKey(g_hWnd, kVizHotkeyId);
-    FeedbackShow(false);
+    BadgeDestroy(hInstance);
     VizDestroy(hInstance);
     DestroyWindow(g_hWnd);
     g_hWnd = nullptr;
